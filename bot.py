@@ -30,9 +30,9 @@ IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 EQUITY_OPEN  = datetime.time(9, 15)
 EQUITY_CLOSE = datetime.time(15, 30)
 
-# Crude Oil MCX hours (IST) — evening session
-CRUDE_OPEN   = datetime.time(19, 0)   # 7:00 PM
-CRUDE_CLOSE  = datetime.time(22, 0)   # 10:00 PM
+# Crude Oil MCX hours (IST) — full session
+CRUDE_OPEN   = datetime.time(16, 0)   # 4:00 PM
+CRUDE_CLOSE  = datetime.time(23, 0)   # 11:00 PM
 
 # Signal intervals (seconds)
 SCALP_INTERVAL    = 300    # 5 min
@@ -44,7 +44,7 @@ MORNING_HOUR = 8
 MORNING_MIN  = 45
 
 # Evening crude briefing
-CRUDE_BRIEF_HOUR = 18
+CRUDE_BRIEF_HOUR = 15
 CRUDE_BRIEF_MIN  = 45
 
 # Risk Management
@@ -384,7 +384,7 @@ def generate_equity_signal(chat_id: str, mode: str = "intraday"):
 # ─────────────────────────────────────────────
 def generate_crude_signal(chat_id: str, mode: str = "crude"):
     if not is_crude_open():
-        send_telegram(chat_id, "⛽ Crude Oil session is not active right now.\n🕖 Crude signals run 7:00 PM – 10:00 PM IST.")
+        send_telegram(chat_id, "⛽ Crude Oil session is not active right now.\n🕓 Crude signals run 4:00 PM – 11:00 PM IST.")
         return
 
     balance = user_balance.get(chat_id, 50000)
@@ -427,7 +427,7 @@ def generate_crude_signal(chat_id: str, mode: str = "crude"):
 
 {sig_emoji}
 🎯 Strike: <b>CRUDE {opt_label}</b>
-⏰ Evening Session (7PM–10PM IST)
+⏰ Evening Session (4PM–11PM IST)
 
 💰 <b>Est. Premium:</b> ₹{premium}
 🛑 <b>Stop Loss:</b>   ₹{sl_px}  (−₹{sl_val})
@@ -481,7 +481,7 @@ def send_morning_briefing(chat_id: str):
 {bal_line}
 
 🕘 <b>Equity signals:</b>  9:15 AM – 3:30 PM
-🛢️ <b>Crude signals:</b>  7:00 PM – 10:00 PM
+🛢️ <b>Crude signals:</b>  4:00 PM – 11:00 PM
 
 <b>Commands:</b>
 /balance 50000 → set capital
@@ -534,7 +534,7 @@ def handle_command(chat_id: str, text: str):
 I send BUY CALL / BUY PUT signals for:
 • 📊 Nifty 50         (9:15 AM – 3:30 PM)
 • 🏦 Bank Nifty       (9:15 AM – 3:30 PM)
-• 🛢️ Crude Oil (MCX) (7:00 PM – 10:00 PM)
+• 🛢️ Crude Oil (MCX) (4:00 PM – 11:00 PM)
 
 Every signal includes:
 ✅ Strike price (CE/PE)
@@ -602,8 +602,8 @@ Auto Signals:
 📅 <b>Schedule:</b>
 • 8:45 AM  → Morning briefing
 • 9:15 AM  → Equity signals start
-• 6:45 PM  → Crude Oil briefing
-• 7:00 PM  → Crude signals start
+• 3:45 PM  → Crude Oil briefing
+• 4:00 PM  → Crude signals start
 
 ⚠️ Always use Stop Loss!
 """.strip())
