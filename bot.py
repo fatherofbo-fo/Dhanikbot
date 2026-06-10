@@ -21,8 +21,8 @@ from ta.volatility import BollingerBands, AverageTrueRange
 # ─────────────────────────────────────────────
 #  CONFIG  (edit these)
 # ─────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID_HERE")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8969876449:AAFr2ytAq_KKUTcaKo5Rf1X-f_fAeLYyEnQ")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "877753785")
 
 # Market hours (IST)
 MARKET_OPEN   = datetime.time(9, 15)
