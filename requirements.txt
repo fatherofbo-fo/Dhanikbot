@@ -1,5 +1,5 @@
-yfinance==0.2.40
-pandas==2.2.2
-numpy==1.26.4
-ta==0.11.0
-requests==2.32.3
+yfinance
+pandas
+numpy
+ta
+requests
