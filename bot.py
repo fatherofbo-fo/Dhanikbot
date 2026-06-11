@@ -165,6 +165,368 @@ def is_expiry_today(expiry_weekday: int) -> bool:
     return ist_now().weekday() == expiry_weekday
 
 # ─────────────────────────────────────────────
+#  ADVANCED LEVEL ANALYSIS ENGINE
+#  Calculates key levels from live market data:
+#  - Previous Day High/Low (PDH/PDL)
+#  - Opening Range (first 15 min)
+#  - VWAP
+#  - CPR (Central Pivot Range)
+#  - Support & Resistance zones
+#  - Breakout / Breakdown detection
+# ─────────────────────────────────────────────
+
+# Stores today's calculated levels per instrument
+market_levels = {}   # symbol -> dict of levels
+level_alerts_sent = {}  # symbol+level_key -> bool (prevent duplicate alerts)
+
+def compute_vwap(df: pd.DataFrame) -> float:
+    """VWAP = sum(price * volume) / sum(volume)"""
+    try:
+        typical = (df["High"] + df["Low"] + df["Close"]) / 3
+        vwap = (typical * df["Volume"]).cumsum() / df["Volume"].cumsum()
+        return round(float(vwap.iloc[-1]), 2)
+    except:
+        return None
+
+def compute_cpr(prev_high: float, prev_low: float, prev_close: float) -> dict:
+    """
+    Central Pivot Range (CPR) — widely used by Indian traders
+    Pivot = (H + L + C) / 3
+    BC (Bottom Central) = (H + L) / 2
+    TC (Top Central)    = (Pivot - BC) + Pivot
+    """
+    pivot = round((prev_high + prev_low + prev_close) / 3, 2)
+    bc    = round((prev_high + prev_low) / 2, 2)
+    tc    = round((pivot - bc) + pivot, 2)
+
+    # Standard S/R levels
+    r1 = round(2 * pivot - prev_low, 2)
+    r2 = round(pivot + (prev_high - prev_low), 2)
+    r3 = round(prev_high + 2 * (pivot - prev_low), 2)
+    s1 = round(2 * pivot - prev_high, 2)
+    s2 = round(pivot - (prev_high - prev_low), 2)
+    s3 = round(prev_low - 2 * (prev_high - pivot), 2)
+
+    return {
+        "pivot": pivot, "tc": tc, "bc": bc,
+        "r1": r1, "r2": r2, "r3": r3,
+        "s1": s1, "s2": s2, "s3": s3,
+    }
+
+def get_opening_range(df: pd.DataFrame) -> dict:
+    """
+    Opening Range = High & Low of first 15 minutes (9:15–9:30)
+    Breakout above OR High = strong buy signal
+    Breakdown below OR Low = strong sell signal
+    """
+    try:
+        now = ist_now()
+        today = now.date()
+        # Filter today's candles only
+        today_df = df[df.index.date == today]
+        if today_df.empty:
+            return None
+        # First 15 min = first 3 candles of 5min data
+        or_df = today_df.iloc[:3]
+        if len(or_df) < 2:
+            return None
+        return {
+            "high": round(float(or_df["High"].max()), 2),
+            "low":  round(float(or_df["Low"].min()), 2),
+        }
+    except:
+        return None
+
+def calculate_levels(symbol: str, df_5m: pd.DataFrame, df_daily=None) -> dict:
+    """
+    Calculate all key levels for a symbol.
+    Returns dict with all support/resistance/breakout levels.
+    """
+    try:
+        now      = ist_now()
+        today    = now.date()
+
+        # Today's data
+        today_df = df_5m[df_5m.index.date == today] if hasattr(df_5m.index, 'date') else df_5m
+
+        # Previous day data
+        all_dates = sorted(set(df_5m.index.date)) if hasattr(df_5m.index, 'date') else []
+        prev_dates = [d for d in all_dates if d < today]
+
+        pdh = pdl = pdc = None
+        if prev_dates:
+            prev_day = prev_dates[-1]
+            prev_df  = df_5m[df_5m.index.date == prev_day]
+            if not prev_df.empty:
+                pdh = round(float(prev_df["High"].max()), 2)
+                pdl = round(float(prev_df["Low"].min()), 2)
+                pdc = round(float(prev_df["Close"].iloc[-1]), 2)
+
+        cpr = compute_cpr(pdh, pdl, pdc) if all([pdh, pdl, pdc]) else None
+        or_levels = get_opening_range(df_5m)
+        vwap = compute_vwap(today_df) if not today_df.empty else None
+
+        current_price = round(float(df_5m["Close"].iloc[-1]), 2)
+
+        # Swing highs/lows from last 20 candles = dynamic S/R
+        recent = df_5m.tail(20)
+        swing_high = round(float(recent["High"].max()), 2)
+        swing_low  = round(float(recent["Low"].min()), 2)
+
+        # Day high/low so far
+        day_high = round(float(today_df["High"].max()), 2) if not today_df.empty else None
+        day_low  = round(float(today_df["Low"].min()), 2)  if not today_df.empty else None
+
+        return {
+            "price":      current_price,
+            "pdh":        pdh,
+            "pdl":        pdl,
+            "pdc":        pdc,
+            "cpr":        cpr,
+            "or":         or_levels,
+            "vwap":       vwap,
+            "swing_high": swing_high,
+            "swing_low":  swing_low,
+            "day_high":   day_high,
+            "day_low":    day_low,
+        }
+    except Exception as e:
+        print(f"Level calc error: {e}")
+        return None
+
+def detect_breakout(levels: dict, df: pd.DataFrame) -> list:
+    """
+    Scans live price vs key levels and returns list of active setups.
+    Each setup = dict with: type, level, direction, reason, confidence
+    """
+    setups   = []
+    price    = levels["price"]
+    atr      = round(float(AverageTrueRange(df["High"], df["Low"], df["Close"], window=14)
+                           .average_true_range().iloc[-1]), 2)
+    vol      = df["Volume"]
+    vol_ratio = round(float(vol.iloc[-1] / vol.rolling(20).mean().iloc[-1]), 2) \
+                if vol.rolling(20).mean().iloc[-1] > 0 else 1.0
+
+    # Buffer = 0.1% of price (avoids false breakouts)
+    buf = round(price * 0.001, 2)
+
+    # ── 1. Opening Range Breakout (ORB) ──
+    if levels.get("or"):
+        orh = levels["or"]["high"]
+        orl = levels["or"]["low"]
+        if price > orh + buf and vol_ratio > 1.3:
+            setups.append({
+                "type": "ORB_BULL", "level": orh, "direction": "CALL",
+                "reason": f"🔓 Opening Range Breakout above ₹{orh}",
+                "confidence": 80 if vol_ratio > 1.8 else 65,
+                "entry_note": f"Price broke above morning high ₹{orh} with {vol_ratio}x volume"
+            })
+        elif price < orl - buf and vol_ratio > 1.3:
+            setups.append({
+                "type": "ORB_BEAR", "level": orl, "direction": "PUT",
+                "reason": f"🔓 Opening Range Breakdown below ₹{orl}",
+                "confidence": 80 if vol_ratio > 1.8 else 65,
+                "entry_note": f"Price broke below morning low ₹{orl} with {vol_ratio}x volume"
+            })
+
+    # ── 2. Previous Day High/Low Breakout ──
+    if levels.get("pdh") and levels.get("pdl"):
+        pdh = levels["pdh"]
+        pdl = levels["pdl"]
+        if price > pdh + buf and vol_ratio > 1.2:
+            setups.append({
+                "type": "PDH_BREAK", "level": pdh, "direction": "CALL",
+                "reason": f"📈 Broke Previous Day High ₹{pdh}",
+                "confidence": 75,
+                "entry_note": f"Strong breakout above PDH ₹{pdh} — momentum trade"
+            })
+        elif price < pdl - buf and vol_ratio > 1.2:
+            setups.append({
+                "type": "PDL_BREAK", "level": pdl, "direction": "PUT",
+                "reason": f"📉 Broke Previous Day Low ₹{pdl}",
+                "confidence": 75,
+                "entry_note": f"Strong breakdown below PDL ₹{pdl} — momentum trade"
+            })
+
+    # ── 3. VWAP Crossover ──
+    if levels.get("vwap"):
+        vwap = levels["vwap"]
+        prev_close = float(df["Close"].iloc[-2])
+        if prev_close < vwap and price > vwap + buf:
+            setups.append({
+                "type": "VWAP_CROSS_UP", "level": vwap, "direction": "CALL",
+                "reason": f"📊 Price crossed above VWAP ₹{vwap}",
+                "confidence": 65,
+                "entry_note": f"Bullish VWAP reclaim — institutions buying above ₹{vwap}"
+            })
+        elif prev_close > vwap and price < vwap - buf:
+            setups.append({
+                "type": "VWAP_CROSS_DOWN", "level": vwap, "direction": "PUT",
+                "reason": f"📊 Price fell below VWAP ₹{vwap}",
+                "confidence": 65,
+                "entry_note": f"Bearish VWAP rejection — selling pressure below ₹{vwap}"
+            })
+
+    # ── 4. CPR Breakout ──
+    if levels.get("cpr"):
+        cpr = levels["cpr"]
+        tc  = cpr["tc"]
+        bc  = cpr["bc"]
+        r1  = cpr["r1"]
+        s1  = cpr["s1"]
+
+        if price > tc + buf and vol_ratio > 1.2:
+            setups.append({
+                "type": "CPR_BULL", "level": tc, "direction": "CALL",
+                "reason": f"🎯 Breakout above CPR Top ₹{tc}",
+                "confidence": 70,
+                "entry_note": f"Above CPR — next target R1 at ₹{r1}"
+            })
+        elif price < bc - buf and vol_ratio > 1.2:
+            setups.append({
+                "type": "CPR_BEAR", "level": bc, "direction": "PUT",
+                "reason": f"🎯 Breakdown below CPR Bottom ₹{bc}",
+                "confidence": 70,
+                "entry_note": f"Below CPR — next target S1 at ₹{s1}"
+            })
+
+        # R1/S1 breakout
+        if price > r1 + buf and vol_ratio > 1.5:
+            setups.append({
+                "type": "R1_BREAK", "level": r1, "direction": "CALL",
+                "reason": f"🚀 Strong breakout above R1 ₹{r1}",
+                "confidence": 78,
+                "entry_note": f"R1 broken with volume — next target R2 at ₹{cpr['r2']}"
+            })
+        elif price < s1 - buf and vol_ratio > 1.5:
+            setups.append({
+                "type": "S1_BREAK", "level": s1, "direction": "PUT",
+                "reason": f"💥 Strong breakdown below S1 ₹{s1}",
+                "confidence": 78,
+                "entry_note": f"S1 broken with volume — next target S2 at ₹{cpr['s2']}"
+            })
+
+    # ── 5. Swing High/Low Break ──
+    sh = levels.get("swing_high")
+    sl_lvl = levels.get("swing_low")
+    if sh and price > sh + buf and vol_ratio > 1.4:
+        setups.append({
+            "type": "SWING_HIGH", "level": sh, "direction": "CALL",
+            "reason": f"⚡ 20-candle swing high ₹{sh} broken",
+            "confidence": 72,
+            "entry_note": f"Fresh breakout above ₹{sh} — strong momentum"
+        })
+    if sl_lvl and price < sl_lvl - buf and vol_ratio > 1.4:
+        setups.append({
+            "type": "SWING_LOW", "level": sl_lvl, "direction": "PUT",
+            "reason": f"⚡ 20-candle swing low ₹{sl_lvl} broken",
+            "confidence": 72,
+            "entry_note": f"Fresh breakdown below ₹{sl_lvl} — strong momentum"
+        })
+
+    return setups
+
+def format_level_alert(inst: dict, setup: dict, levels: dict,
+                        premium: float, sl_px, sl_val,
+                        tp1_px, tp1_val, tp2_px, tp2_val,
+                        max_loss, max_profit, lots: int,
+                        expiry_str: str) -> str:
+    """Format the advanced level-based alert message"""
+    cpr   = levels.get("cpr", {})
+    vwap  = levels.get("vwap", "—")
+    pdh   = levels.get("pdh", "—")
+    pdl   = levels.get("pdl", "—")
+    price = levels["price"]
+    direction = "BUY CALL 📈" if setup["direction"] == "CALL" else "BUY PUT 📉"
+    opt_type  = "CE" if setup["direction"] == "CALL" else "PE"
+    strike    = get_nearest_strike(price, inst["strike_step"])
+
+    return f"""
+🚨 <b>LEVEL ALERT — {inst['full_name']}</b>
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+{setup['reason']}
+
+📌 <b>{direction}</b>
+🎯 Strike: <b>{inst['name']} {strike}{opt_type}</b>
+📅 Expiry: {expiry_str}
+
+💡 <b>Why this trade:</b>
+{setup['entry_note']}
+
+💰 Buy @ <b>₹{premium}</b>
+
+🎯 TP 1  =  <b>₹{tp1_px}</b>  (+₹{tp1_val})
+🎯 TP 2  =  <b>₹{tp2_px}</b>  (+₹{tp2_val})
+🛑 SL    =  <b>₹{sl_px}</b>   (−₹{sl_val})
+
+📦 Lots: {lots} × {inst['lot_size']} qty
+💸 Max Loss:   ₹{int(max_loss):,}
+💰 Max Profit: ₹{int(max_profit):,}
+📐 R:R = 1:{round(tp2_val/sl_val, 1)}
+
+📊 <b>Key Levels Today:</b>
+   Spot:  ₹{price}
+   VWAP:  ₹{vwap}
+   PDH:   ₹{pdh}  |  PDL: ₹{pdl}
+   CPR:   ₹{cpr.get('bc','—')} – ₹{cpr.get('tc','—')}
+   OR:    ₹{levels.get('or',{}).get('low','—')} – ₹{levels.get('or',{}).get('high','—')}
+
+🔵 Confidence: {setup['confidence']}%
+
+⚠️ <i>Wait for 15-min candle close above/below level.
+Exit at TP1 if unsure. Move SL to entry after TP1 hits.
+AI signal only — trade at your own risk.</i>
+""".strip()
+
+
+def send_daily_levels(chat_id: str):
+    """Send morning level briefing with all key levels for the day"""
+    now = ist_now()
+    msg_parts = [f"📐 <b>KEY LEVELS FOR TODAY — {now.strftime('%d %b %Y')}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+
+    for inst in EQUITY_INSTRUMENTS:
+        df = get_ohlcv(inst["symbol"], period="5d", interval="5m")
+        if df is None:
+            continue
+        levels = calculate_levels(inst["symbol"], df)
+        if not levels:
+            continue
+
+        cpr  = levels.get("cpr", {})
+        vwap = levels.get("vwap", "—")
+        orh  = levels.get("or", {}).get("high", "calculating...")
+        orl  = levels.get("or", {}).get("low",  "calculating...")
+
+        part = f"""
+{inst['full_name']} — ₹{levels['price']}
+
+📊 CPR:  ₹{cpr.get('bc','—')} – ₹{cpr.get('tc','—')}
+📌 Pivot: ₹{cpr.get('pivot','—')}
+🔺 R1: ₹{cpr.get('r1','—')}  R2: ₹{cpr.get('r2','—')}
+🔻 S1: ₹{cpr.get('s1','—')}  S2: ₹{cpr.get('s2','—')}
+📈 PDH: ₹{levels.get('pdh','—')}
+📉 PDL: ₹{levels.get('pdl','—')}
+💧 VWAP: ₹{vwap}
+⏰ OR High: ₹{orh}  |  OR Low: ₹{orl}
+
+🟢 BUY CALL if price breaks above:
+   → ₹{cpr.get('tc','—')} (CPR top)
+   → ₹{cpr.get('r1','—')} (R1)
+   → ₹{levels.get('pdh','—')} (PDH)
+
+🔴 BUY PUT if price breaks below:
+   → ₹{cpr.get('bc','—')} (CPR bottom)
+   → ₹{cpr.get('s1','—')} (S1)
+   → ₹{levels.get('pdl','—')} (PDL)
+""".strip()
+        msg_parts.append(part)
+        msg_parts.append("─────────────────────────")
+
+    msg_parts.append("\n⚡ <i>Auto alerts will fire when price hits these levels with volume confirmation.</i>")
+    send_telegram(chat_id, "\n".join(msg_parts))
+
+# ─────────────────────────────────────────────
 #  TECHNICAL ANALYSIS
 # ─────────────────────────────────────────────
 def compute_indicators(df: pd.DataFrame) -> dict:
@@ -411,6 +773,60 @@ AI signal only — trade at your own risk.</i>
 # ─────────────────────────────────────────────
 #  SIGNAL GENERATORS
 # ─────────────────────────────────────────────
+def generate_level_alerts(chat_id: str):
+    """
+    Scans live price against key levels and fires alerts
+    when breakout/breakdown detected with volume confirmation.
+    Prevents duplicate alerts for same level same day.
+    """
+    if not is_equity_open():
+        return
+
+    balance   = user_balance.get(chat_id, 50000)
+    today_str = ist_now().strftime("%Y-%m-%d")
+
+    for inst in EQUITY_INSTRUMENTS:
+        df = get_ohlcv(inst["symbol"], period="5d", interval="5m")
+        if df is None:
+            continue
+
+        levels = calculate_levels(inst["symbol"], df)
+        if not levels:
+            continue
+
+        setups = detect_breakout(levels, df)
+        if not setups:
+            continue
+
+        for setup in setups:
+            # Deduplicate — don't send same alert twice today
+            alert_key = f"{chat_id}_{inst['name']}_{setup['type']}_{today_str}"
+            if level_alerts_sent.get(alert_key):
+                continue
+            level_alerts_sent[alert_key] = True
+
+            price      = levels["price"]
+            days       = days_to_expiry(inst["expiry_day"])
+            expiry_str = next_expiry_date(inst["expiry_day"])
+            strike     = get_nearest_strike(price, inst["strike_step"])
+            ind        = compute_indicators(df)
+            premium    = estimate_equity_premium(price, strike, ind["atr"],
+                                                 setup["direction"], days)
+            lots = max(1, int((balance * DEFAULT_RISK_PERCENT / 100) /
+                              (premium * 0.20 * inst["lot_size"])))
+            sl_px, sl_val, tp1_px, tp1_val, tp2_px, tp2_val, max_loss, max_profit = \
+                balance_driven_sl_tgt(balance, premium, inst["lot_size"])
+
+            msg = format_level_alert(
+                inst, setup, levels, premium,
+                sl_px, sl_val, tp1_px, tp1_val, tp2_px, tp2_val,
+                max_loss, max_profit, lots, expiry_str
+            )
+            print(f"[LEVEL ALERT] {inst['name']} {setup['type']} → {chat_id}")
+            send_telegram(chat_id, msg)
+            time.sleep(1)
+
+
 def generate_equity_signal(chat_id: str, mode: str = "intraday"):
     if not is_equity_open():
         return
@@ -599,6 +1015,10 @@ Each signal:
         send_telegram(chat_id, "⚡ Running scalp analysis...")
         threading.Thread(target=generate_equity_signal, args=(chat_id, "scalp")).start()
 
+    elif cmd == "/levels":
+        send_telegram(chat_id, "📐 Calculating today's key levels...")
+        threading.Thread(target=send_daily_levels, args=(chat_id,)).start()
+
     elif cmd == "/crude":
         send_telegram(chat_id, "🛢️ Fetching live Crude data...")
         threading.Thread(target=generate_crude_signal, args=(chat_id,)).start()
@@ -623,15 +1043,25 @@ Next Sensex Expiry: {next_expiry_date(4)}""".strip())
 /balance 50000 → Set capital
 /signal        → Nifty + Sensex signal now
 /scalp         → Scalp signal now
+/levels        → Today's key levels (CPR, S/R, VWAP)
 /crude         → Crude Oil signal now
 /status        → Market status
 /help          → This menu
 
 📅 Auto Schedule:
 • 8:45 AM  → Morning briefing
+• 9:16 AM  → Daily key levels sent
 • 9:15 AM  → Equity signals (every 5/15 min)
+• Every 2 min → Level breakout scan
 • 3:45 PM  → Crude briefing
-• 4:00 PM  → Crude signals (every 10 min)""".strip())
+• 4:00 PM  → Crude signals (every 10 min)
+
+🚨 <b>Level Alerts fire automatically when:</b>
+• Opening Range breakout/breakdown
+• Previous Day High/Low broken
+• VWAP crossover
+• CPR breakout
+• R1/S1 broken with volume""".strip())
 
 # ─────────────────────────────────────────────
 #  SCHEDULER
@@ -642,6 +1072,8 @@ def scheduler_loop():
     last_crude       = {}
     last_morning     = {}
     last_crude_brief = {}
+    last_levels      = {}   # daily levels briefing
+    last_level_scan  = {}   # level alert scan
 
     print("📡 Scheduler started...")
 
@@ -653,30 +1085,44 @@ def scheduler_loop():
             eq_open   = is_equity_open()
             cr_open   = is_crude_open()
 
-            # Log every 5 min so Railway console shows bot is alive
             if now.minute % 5 == 0 and now.second < 30:
-                print(f"[{now.strftime('%H:%M')} IST] Users: {len(user_balance)} | Equity: {'OPEN' if eq_open else 'closed'} | Crude: {'OPEN' if cr_open else 'closed'}")
+                print(f"[{now.strftime('%H:%M')} IST] Users:{len(user_balance)} Equity:{'OPEN' if eq_open else 'closed'} Crude:{'OPEN' if cr_open else 'closed'}")
 
             for chat_id in list(user_balance.keys()):
 
+                # Morning briefing 8:45 AM
                 if now.hour == MORNING_HOUR and now.minute == MORNING_MIN:
                     if last_morning.get(chat_id) != today_str:
                         send_morning_briefing(chat_id)
                         last_morning[chat_id] = today_str
 
+                # Daily levels at 9:16 AM (right after market opens)
+                if now.hour == 9 and now.minute == 16:
+                    if last_levels.get(chat_id) != today_str:
+                        threading.Thread(target=send_daily_levels, args=(chat_id,)).start()
+                        last_levels[chat_id] = today_str
+
+                # Crude briefing 3:45 PM
                 if now.hour == CRUDE_BRIEF_HOUR and now.minute == CRUDE_BRIEF_MIN:
                     if last_crude_brief.get(chat_id) != today_str:
                         send_crude_briefing(chat_id)
                         last_crude_brief[chat_id] = today_str
 
                 if eq_open:
+                    # Level-based alerts every 2 min (most important)
+                    if ts - last_level_scan.get(chat_id, 0) >= 120:
+                        threading.Thread(target=generate_level_alerts, args=(chat_id,)).start()
+                        last_level_scan[chat_id] = ts
+
+                    # Regular scalp signals every 5 min
                     if ts - last_scalp.get(chat_id, 0) >= SCALP_INTERVAL:
-                        print(f"[{now.strftime('%H:%M')}] Sending scalp signal to {chat_id}")
+                        print(f"[{now.strftime('%H:%M')}] Scalp signal → {chat_id}")
                         threading.Thread(target=generate_equity_signal, args=(chat_id, "scalp")).start()
                         last_scalp[chat_id] = ts
 
+                    # Intraday signals every 15 min
                     if ts - last_intraday.get(chat_id, 0) >= INTRADAY_INTERVAL:
-                        print(f"[{now.strftime('%H:%M')}] Sending intraday signal to {chat_id}")
+                        print(f"[{now.strftime('%H:%M')}] Intraday signal → {chat_id}")
                         threading.Thread(target=generate_equity_signal, args=(chat_id, "intraday")).start()
                         last_intraday[chat_id] = ts
 
@@ -692,14 +1138,14 @@ def scheduler_loop():
 
                 if cr_open:
                     if ts - last_crude.get(chat_id, 0) >= CRUDE_INTERVAL:
-                        print(f"[{now.strftime('%H:%M')}] Sending crude signal to {chat_id}")
+                        print(f"[{now.strftime('%H:%M')}] Crude signal → {chat_id}")
                         threading.Thread(target=generate_crude_signal, args=(chat_id,)).start()
                         last_crude[chat_id] = ts
 
         except Exception as e:
             print(f"Scheduler error: {e}")
 
-        time.sleep(30)  # Check every 30s instead of 60s for better responsiveness
+        time.sleep(30)
 
 # ─────────────────────────────────────────────
 #  MAIN
