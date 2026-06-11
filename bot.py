@@ -643,11 +643,19 @@ def scheduler_loop():
     last_morning     = {}
     last_crude_brief = {}
 
+    print("📡 Scheduler started...")
+
     while True:
         try:
             now       = ist_now()
             today_str = now.strftime("%Y-%m-%d")
             ts        = now.timestamp()
+            eq_open   = is_equity_open()
+            cr_open   = is_crude_open()
+
+            # Log every 5 min so Railway console shows bot is alive
+            if now.minute % 5 == 0 and now.second < 30:
+                print(f"[{now.strftime('%H:%M')} IST] Users: {len(user_balance)} | Equity: {'OPEN' if eq_open else 'closed'} | Crude: {'OPEN' if cr_open else 'closed'}")
 
             for chat_id in list(user_balance.keys()):
 
@@ -661,11 +669,14 @@ def scheduler_loop():
                         send_crude_briefing(chat_id)
                         last_crude_brief[chat_id] = today_str
 
-                if is_equity_open():
+                if eq_open:
                     if ts - last_scalp.get(chat_id, 0) >= SCALP_INTERVAL:
+                        print(f"[{now.strftime('%H:%M')}] Sending scalp signal to {chat_id}")
                         threading.Thread(target=generate_equity_signal, args=(chat_id, "scalp")).start()
                         last_scalp[chat_id] = ts
+
                     if ts - last_intraday.get(chat_id, 0) >= INTRADAY_INTERVAL:
+                        print(f"[{now.strftime('%H:%M')}] Sending intraday signal to {chat_id}")
                         threading.Thread(target=generate_equity_signal, args=(chat_id, "intraday")).start()
                         last_intraday[chat_id] = ts
 
@@ -679,22 +690,39 @@ def scheduler_loop():
                                         threading.Thread(target=generate_equity_signal, args=(chat_id, "expiry")).start()
                                         active_signals[key] = True
 
-                if is_crude_open():
+                if cr_open:
                     if ts - last_crude.get(chat_id, 0) >= CRUDE_INTERVAL:
+                        print(f"[{now.strftime('%H:%M')}] Sending crude signal to {chat_id}")
                         threading.Thread(target=generate_crude_signal, args=(chat_id,)).start()
                         last_crude[chat_id] = ts
 
         except Exception as e:
             print(f"Scheduler error: {e}")
 
-        time.sleep(60)
+        time.sleep(30)  # Check every 30s instead of 60s for better responsiveness
 
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 def main():
     print("🤖 Bot started — Nifty + Sensex + Crude Oil")
-    send_telegram(TELEGRAM_CHAT_ID, "🤖 Bot started!\n\n📊 Nifty 50 + Sensex + 🛢️ Crude Oil\nSend /start to begin.")
+
+    # ── FIX 1: Auto-register the owner's chat_id on startup ──
+    # This ensures signals fire even if /balance wasn't re-sent after redeploy
+    if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID != "YOUR_CHAT_ID_HERE":
+        if TELEGRAM_CHAT_ID not in user_balance:
+            user_balance[TELEGRAM_CHAT_ID] = 50000   # default ₹50,000 until user updates
+            print(f"Auto-registered chat_id: {TELEGRAM_CHAT_ID} with default balance ₹50,000")
+
+    send_telegram(TELEGRAM_CHAT_ID,
+        "🤖 Bot started!\n\n"
+        "📊 Nifty 50 + Sensex + 🛢️ Crude Oil\n\n"
+        "⚠️ <b>Important:</b> Send your balance to get sized signals:\n"
+        "<code>/balance 50000</code>\n\n"
+        "Until then, signals use default ₹50,000 balance.\n"
+        "Send /signal to test right now!"
+    )
+
     threading.Thread(target=scheduler_loop, daemon=True).start()
 
     offset = None
@@ -709,6 +737,9 @@ def main():
                         chat_id = str(msg["chat"]["id"])
                         text    = msg.get("text", "")
                         if text:
+                            # ── FIX 2: Auto-register any new user who messages the bot ──
+                            if chat_id not in user_balance:
+                                user_balance[chat_id] = 50000
                             handle_command(chat_id, text)
         except Exception as e:
             print(f"Polling error: {e}")
