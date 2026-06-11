@@ -48,17 +48,17 @@ EQUITY_INSTRUMENTS = [
         "name":        "NIFTY",
         "full_name":   "Nifty 50",
         "symbol":      "^NSEI",
-        "lot_size":    65,   # Nifty 50 lot = 65
+        "lot_size":    65,
         "strike_step": 50,
-        "expiry_day":  3,    # Thursday
+        "expiry_day":  1,    # Tuesday (NSE changed from Thursday to Tuesday, Sep 2025)
     },
     {
         "name":        "SENSEX",
         "full_name":   "BSE Sensex",
         "symbol":      "^BSESN",
-        "lot_size":    20,   # Sensex lot = 20
+        "lot_size":    20,
         "strike_step": 100,
-        "expiry_day":  4,    # Friday
+        "expiry_day":  3,    # Thursday (BSE Sensex weekly expiry)
     },
 ]
 
@@ -509,8 +509,8 @@ def send_morning_briefing(chat_id: str):
     usd_inr      = get_usd_inr()
     crude_inr    = round(crude_usd * usd_inr, 1) if crude_usd else None
 
-    nifty_expiry  = "🔴 TODAY" if ist_now().weekday() == 3 else next_expiry_date(3)
-    sensex_expiry = "🔴 TODAY" if ist_now().weekday() == 4 else next_expiry_date(4)
+    nifty_expiry  = "🔴 TODAY" if ist_now().weekday() == 1 else next_expiry_date(1)
+    sensex_expiry = "🔴 TODAY" if ist_now().weekday() == 3 else next_expiry_date(3)
 
     bal_line = f"💼 Balance: <b>₹{int(balance):,}</b>  |  Risk/trade: ₹{int(balance*0.02):,}" \
                if balance > 0 else "💼 Set balance: <code>/balance 50000</code>"
