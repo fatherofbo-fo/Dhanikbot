@@ -1,8 +1,6 @@
 """
-Nifty/BankNifty/Crude Oil F&O Signal Bot
-- Equity (Nifty + BankNifty): 9:15 AM – 3:30 PM IST
-- Crude Oil (MCX):             4:00 PM – 11:00 PM IST
-Premium for Crude: fetched LIVE from MCX via NSE API
+F&O Signal Bot — Nifty 50 + Sensex + Crude Oil
+Signal format: clean card style with TP1, TP2, SL
 """
 
 import os
@@ -28,12 +26,12 @@ IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 EQUITY_OPEN  = datetime.time(9, 15)
 EQUITY_CLOSE = datetime.time(15, 30)
-CRUDE_OPEN   = datetime.time(16, 0)    # 4:00 PM
-CRUDE_CLOSE  = datetime.time(23, 0)    # 11:00 PM
+CRUDE_OPEN   = datetime.time(16, 0)
+CRUDE_CLOSE  = datetime.time(23, 0)
 
-SCALP_INTERVAL    = 300
-INTRADAY_INTERVAL = 900
-CRUDE_INTERVAL    = 600
+SCALP_INTERVAL    = 300    # 5 min
+INTRADAY_INTERVAL = 900    # 15 min
+CRUDE_INTERVAL    = 600    # 10 min
 
 MORNING_HOUR     = 8
 MORNING_MIN      = 45
@@ -41,23 +39,35 @@ CRUDE_BRIEF_HOUR = 15
 CRUDE_BRIEF_MIN  = 45
 
 DEFAULT_RISK_PERCENT = 2.0
-SL_PERCENT           = 25
-TARGET_PERCENT       = 50
 
 # ─────────────────────────────────────────────
-#  INSTRUMENTS
+#  INSTRUMENTS  (BankNifty removed, Sensex added)
 # ─────────────────────────────────────────────
 EQUITY_INSTRUMENTS = [
-    {"name": "NIFTY 50",   "symbol": "^NSEI",    "lot_size": 25,  "strike_step": 50,  "type": "equity"},
-    {"name": "BANK NIFTY", "symbol": "^NSEBANK",  "lot_size": 15,  "strike_step": 100, "type": "equity"},
+    {
+        "name":        "NIFTY",
+        "full_name":   "Nifty 50",
+        "symbol":      "^NSEI",
+        "lot_size":    65,   # Nifty 50 lot = 65
+        "strike_step": 50,
+        "expiry_day":  3,    # Thursday
+    },
+    {
+        "name":        "SENSEX",
+        "full_name":   "BSE Sensex",
+        "symbol":      "^BSESN",
+        "lot_size":    20,   # Sensex lot = 20
+        "strike_step": 100,
+        "expiry_day":  4,    # Friday
+    },
 ]
 
 CRUDE_INSTRUMENT = {
-    "name":        "CRUDE OIL (MCX)",
+    "name":        "CRUDEOIL",
+    "full_name":   "Crude Oil MCX",
     "symbol":      "CL=F",
-    "lot_size":    100,       # MCX crude = 100 barrels per lot
-    "strike_step": 100,       # MCX crude strike gap = ₹100
-    "type":        "commodity",
+    "lot_size":    100,  # MCX Crude lot = 100 barrels
+    "strike_step": 100,
 }
 
 # ─────────────────────────────────────────────
@@ -67,7 +77,7 @@ user_balance   = {}
 active_signals = {}
 
 # ─────────────────────────────────────────────
-#  TELEGRAM HELPERS
+#  TELEGRAM
 # ─────────────────────────────────────────────
 def send_telegram(chat_id: str, msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -137,57 +147,22 @@ def is_crude_open():
     now = ist_now()
     return now.weekday() < 6 and CRUDE_OPEN <= now.time() <= CRUDE_CLOSE
 
-def is_expiry_thursday():
-    return ist_now().weekday() == 3
-
-def days_to_expiry() -> int:
+def next_expiry_date(expiry_weekday: int) -> str:
+    """Return next expiry date string e.g. '13 Jun'"""
     now = ist_now()
-    d = (3 - now.weekday()) % 7
+    days_ahead = (expiry_weekday - now.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    expiry = now + datetime.timedelta(days=days_ahead)
+    return expiry.strftime("%-d %b")
+
+def days_to_expiry(expiry_weekday: int) -> int:
+    now = ist_now()
+    d = (expiry_weekday - now.weekday()) % 7
     return d if d > 0 else 7
 
-# ─────────────────────────────────────────────
-#  LIVE CRUDE OPTION PREMIUM (MCX via NSE API)
-# ─────────────────────────────────────────────
-def fetch_live_crude_premium(strike: int, option_type: str, spot_inr: float) -> float:
-    """
-    Tries to fetch live MCX crude option premium.
-    Falls back to Black-Scholes-like estimate if API unavailable.
-    option_type: 'CE' or 'PE'
-    """
-    # Method 1: Try MCX option chain via unofficial API
-    try:
-        now  = ist_now()
-        # Build expiry string — nearest month last day
-        # MCX crude expires on last day of expiry month
-        month_map = {1:"JAN",2:"FEB",3:"MAR",4:"APR",5:"MAY",6:"JUN",
-                     7:"JUL",8:"AUG",9:"SEP",10:"OCT",11:"NOV",12:"DEC"}
-        m = now.month
-        y = now.year
-        exp_str = f"{month_map[m]}{str(y)[2:]}"  # e.g. JUN26
-
-        symbol = f"CRUDEOIL{exp_str}{strike}{option_type}"
-        url = f"https://api.mcxindia.com/api/option-chain?symbol={symbol}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            ltp = data.get("ltp") or data.get("LTP") or data.get("lastPrice")
-            if ltp and float(ltp) > 0:
-                return round(float(ltp), 2)
-    except:
-        pass
-
-    # Method 2: Estimate using realistic crude option pricing
-    # Crude ATM premium is typically 2-4% of spot price
-    # OTM premium drops by ~50% per ₹100 move away from ATM
-    atm_strike = round(spot_inr / 100) * 100
-    distance   = abs(strike - atm_strike)
-    atm_premium = spot_inr * 0.025        # ~2.5% of spot for ATM
-    decay_factor = math.exp(-distance / (spot_inr * 0.03))
-    days = days_to_expiry()
-    time_decay = math.sqrt(days / 30)     # scale by time
-    premium = atm_premium * decay_factor * time_decay
-    return round(max(premium, 5.0), 1)
+def is_expiry_today(expiry_weekday: int) -> bool:
+    return ist_now().weekday() == expiry_weekday
 
 # ─────────────────────────────────────────────
 #  TECHNICAL ANALYSIS
@@ -259,14 +234,14 @@ def score_signal(ind: dict) -> tuple:
     elif rsi < 40:
         bear_score += 15; bear_reasons.append(f"⚡ RSI Weak: {rsi}")
     if rsi > 70:
-        bull_score -= 10; bull_reasons.append("⚠️ RSI Overbought")
+        bull_score -= 10; bull_reasons.append("⚠️ RSI Overbought – caution")
     elif rsi < 30:
-        bear_score -= 10; bear_reasons.append("⚠️ RSI Oversold")
+        bear_score -= 10; bear_reasons.append("⚠️ RSI Oversold – caution")
 
     if stk > std and stk < 80:
-        bull_score += 10; bull_reasons.append(f"📐 Stoch Bullish K:{stk}>D:{std}")
+        bull_score += 10; bull_reasons.append(f"📐 Stoch Bullish K:{stk} > D:{std}")
     elif stk < std and stk > 20:
-        bear_score += 10; bear_reasons.append(f"📐 Stoch Bearish K:{stk}<D:{std}")
+        bear_score += 10; bear_reasons.append(f"📐 Stoch Bearish K:{stk} < D:{std}")
 
     if p < ind["bb_low"]:
         bull_score += 15; bull_reasons.append("🎯 Price at Lower BB – Bounce")
@@ -294,21 +269,147 @@ def score_signal(ind: dict) -> tuple:
 def get_nearest_strike(price: float, step: int) -> int:
     return int(round(price / step) * step)
 
-def estimate_equity_premium(spot: float, strike: float, atr: float, signal: str) -> float:
-    days      = days_to_expiry()
+def estimate_equity_premium(spot: float, strike: float, atr: float,
+                             signal: str, days: int) -> float:
     time_val  = atr * math.sqrt(max(days, 0.5)) * 0.4
     intrinsic = max(0, spot - strike) if signal == "CALL" else max(0, strike - spot)
     return round(intrinsic + time_val, 1)
 
-def calculate_lots(balance: float, premium: float, lot_size: int) -> int:
-    risk_amount = balance * (DEFAULT_RISK_PERCENT / 100)
-    sl_amount   = premium * (SL_PERCENT / 100)
-    if sl_amount <= 0:
-        return 1
-    return max(1, int(risk_amount / (sl_amount * lot_size)))
+def balance_driven_sl_tgt(balance: float, premium: float, lot_size: int):
+    """
+    Calculate SL & two Targets from balance.
+    Max loss = 2% of balance.
+    TP1 = 1:1.5 R:R
+    TP2 = 1:3   R:R
+    """
+    max_loss_rs = balance * DEFAULT_RISK_PERCENT / 100      # e.g. ₹1,000
+    sl_per_unit = round(max_loss_rs / lot_size, 1)          # per share/barrel
+    sl_per_unit = min(sl_per_unit, round(premium * 0.20, 1))# cap at 20% of premium
+    sl_per_unit = max(sl_per_unit, 1.0)
+
+    tp1_per_unit = round(sl_per_unit * 1.5, 1)
+    tp2_per_unit = round(sl_per_unit * 3.0, 1)
+
+    sl_price  = round(premium - sl_per_unit, 1)
+    tp1_price = round(premium + tp1_per_unit, 1)
+    tp2_price = round(premium + tp2_per_unit, 1)
+
+    max_loss   = round(sl_per_unit  * lot_size, 0)
+    max_profit = round(tp2_per_unit * lot_size, 0)
+
+    return sl_price, sl_per_unit, tp1_price, tp1_per_unit, tp2_price, tp2_per_unit, max_loss, max_profit
+
+def fetch_live_crude_premium(strike: int, option_type: str, spot_inr: float) -> float:
+    try:
+        now = ist_now()
+        month_map = {1:"JAN",2:"FEB",3:"MAR",4:"APR",5:"MAY",6:"JUN",
+                     7:"JUL",8:"AUG",9:"SEP",10:"OCT",11:"NOV",12:"DEC"}
+        exp_str = f"{month_map[now.month]}{str(now.year)[2:]}"
+        symbol  = f"CRUDEOIL{exp_str}{strike}{option_type}"
+        r = requests.get(f"https://api.mcxindia.com/api/option-chain?symbol={symbol}",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if r.status_code == 200:
+            ltp = r.json().get("ltp") or r.json().get("LTP")
+            if ltp and float(ltp) > 0:
+                return round(float(ltp), 2)
+    except:
+        pass
+    # Fallback: realistic estimate ~2.5% of spot
+    atm    = round(spot_inr / 100) * 100
+    dist   = abs(strike - atm)
+    prem   = spot_inr * 0.025 * math.exp(-dist / (spot_inr * 0.03))
+    days   = max(3, (ist_now().weekday() - 3) % 7)
+    return round(prem * math.sqrt(days / 30), 1)
 
 # ─────────────────────────────────────────────
-#  SIGNAL — EQUITY
+#  SIGNAL FORMAT  (clean card style)
+# ─────────────────────────────────────────────
+def format_equity_signal(inst: dict, signal: str, spot: float,
+                          strike: int, expiry_str: str, premium: float,
+                          sl_px, sl_val, tp1_px, tp1_val,
+                          tp2_px, tp2_val, max_loss, max_profit,
+                          lots: int, confidence: int, reasons: list,
+                          mode: str) -> str:
+
+    opt_type  = "CE" if signal == "CALL" else "PE"
+    direction = "BUY CALL 📈" if signal == "CALL" else "BUY PUT 📉"
+    mode_tag  = {"scalp": "⚡ Scalping", "expiry": "🔥 Expiry Day"}.get(mode, "📊 Intraday")
+    icon      = "📊" if inst["name"] == "NIFTY" else "📈"
+
+    return f"""
+{icon} <b>{inst['full_name']} — {direction}</b>
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 <b>{inst['name']} {strike}{opt_type}</b>
+📅 Expiry: <b>{expiry_str}</b>
+⏱ Mode: {mode_tag}
+
+💰 Buy @ <b>₹{premium}</b>
+
+🎯 TP 1  =  <b>₹{tp1_px}</b>  (+₹{tp1_val})
+🎯 TP 2  =  <b>₹{tp2_px}</b>  (+₹{tp2_val})
+🛑 SL    =  <b>₹{sl_px}</b>   (−₹{sl_val})
+
+📦 Lots: {lots} × {inst['lot_size']} qty
+💸 Max Loss:   ₹{int(max_loss):,}
+💰 Max Profit: ₹{int(max_profit):,}  (at TP2)
+📐 R:R = 1:{round(tp2_val/sl_val, 1)}
+
+📉 Spot: ₹{spot}  |  RSI: {reasons[0].split(': ')[-1] if 'RSI' in reasons[0] else 'N/A'}
+🔵 Confidence: {confidence}%
+
+📋 Analysis:
+{chr(10).join(reasons[:4])}
+
+⚠️ <i>Exit at TP1 if unsure. Move SL to entry after TP1.
+AI signal only — trade at your own risk.</i>
+""".strip()
+
+
+def format_crude_signal(signal: str, strike: int, expiry_str: str,
+                         premium: float, sl_px, sl_val, tp1_px, tp1_val,
+                         tp2_px, tp2_val, max_loss, max_profit,
+                         spot_inr: float, usd_price: float, usd_inr: float,
+                         rsi: float, confidence: int, reasons: list) -> str:
+
+    opt_type  = "CE" if signal == "CALL" else "PE"
+    direction = "BUY CALL 📈" if signal == "CALL" else "BUY PUT 📉"
+
+    eia_note = "\n⚠️ <b>EIA Data tonight ~9PM — expect big moves!</b>" \
+               if ist_now().weekday() == 2 else ""
+
+    return f"""
+🛢️ <b>Crude Oil MCX — {direction}</b>
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 <b>CRUDEOIL {strike}{opt_type}</b>
+📅 Expiry: <b>{expiry_str}</b>
+⏱ Evening Session (4PM–11PM IST){eia_note}
+
+💰 Buy @ <b>₹{premium}</b>
+
+🎯 TP 1  =  <b>₹{tp1_px}</b>  (+₹{tp1_val}/barrel)
+🎯 TP 2  =  <b>₹{tp2_px}</b>  (+₹{tp2_val}/barrel)
+🛑 SL    =  <b>₹{sl_px}</b>   (−₹{sl_val}/barrel)
+
+📦 1 lot × 100 barrels
+💸 Max Loss:   ₹{int(max_loss):,}
+💰 Max Profit: ₹{int(max_profit):,}  (at TP2)
+📐 R:R = 1:{round(tp2_val/sl_val, 1)}
+
+🛢️ MCX: ₹{spot_inr}/bbl  |  WTI: ${usd_price}/bbl
+💱 USD/INR: ₹{usd_inr}  |  RSI: {rsi}
+🔵 Confidence: {confidence}%
+
+📋 Analysis:
+{chr(10).join(reasons[:4])}
+
+⚠️ <i>Crude is volatile. Exit at TP1 if unsure.
+AI signal only — trade at your own risk.</i>
+""".strip()
+
+# ─────────────────────────────────────────────
+#  SIGNAL GENERATORS
 # ─────────────────────────────────────────────
 def generate_equity_signal(chat_id: str, mode: str = "intraday"):
     if not is_equity_open():
@@ -324,56 +425,29 @@ def generate_equity_signal(chat_id: str, mode: str = "intraday"):
         if signal is None:
             continue
 
-        spot    = ind["price"]
-        strike  = get_nearest_strike(spot, inst["strike_step"])
-        premium = estimate_equity_premium(spot, strike, ind["atr"], signal)
-        sl_val  = round(premium * SL_PERCENT / 100, 1)
-        tgt_val = round(premium * TARGET_PERCENT / 100, 1)
-        sl_px   = round(premium - sl_val, 1)
-        tgt_px  = round(premium + tgt_val, 1)
-        lots    = calculate_lots(balance, premium, inst["lot_size"])
-        max_loss   = round(sl_val  * lots * inst["lot_size"], 0)
-        max_profit = round(tgt_val * lots * inst["lot_size"], 0)
+        spot       = ind["price"]
+        days       = days_to_expiry(inst["expiry_day"])
+        expiry_str = next_expiry_date(inst["expiry_day"])
+        strike     = get_nearest_strike(spot, inst["strike_step"])
+        premium    = estimate_equity_premium(spot, strike, ind["atr"], signal, days)
+        lots       = max(1, int((balance * DEFAULT_RISK_PERCENT / 100) /
+                                (premium * 0.20 * inst["lot_size"])))
 
-        exp_label = "🔴 EXPIRY DAY" if is_expiry_thursday() else f"Expiry in {days_to_expiry()} days"
-        mode_icon = {"scalp": "⚡ SCALP", "expiry": "🔥 EXPIRY"}.get(mode, "📊 INTRADAY")
-        sig_emoji = "🟢 BUY CALL 📈" if signal == "CALL" else "🔴 BUY PUT 📉"
-        opt_label = f"{strike}{'CE' if signal == 'CALL' else 'PE'}"
+        sl_px, sl_val, tp1_px, tp1_val, tp2_px, tp2_val, max_loss, max_profit = \
+            balance_driven_sl_tgt(balance, premium, inst["lot_size"])
 
-        msg = f"""
-╔══════════════════════════╗
-   {mode_icon}  |  {inst['name']}
-╚══════════════════════════╝
-
-{sig_emoji}
-🎯 Strike: <b>{inst['name']} {opt_label}</b>
-⏰ {mode.upper()}  |  {exp_label}
-
-💰 <b>Live Premium:</b> ₹{premium}
-🛑 <b>Stop Loss:</b>   ₹{sl_px}  (−₹{sl_val})
-✅ <b>Target:</b>      ₹{tgt_px}  (+₹{tgt_val})
-
-📦 <b>Lots:</b> {lots} × {inst['lot_size']} qty
-   Max Loss:   ₹{int(max_loss):,}
-   Max Profit: ₹{int(max_profit):,}
-   R:R  →  1:{round(tgt_val/sl_val,1)}
-
-📉 Spot: ₹{spot}   ATR: {ind['atr']}   RSI: {ind['rsi']}
-🔵 Confidence: {confidence}%
-
-📋 <b>Reasons:</b>
-{chr(10).join(reasons[:5])}
-
-⚠️ <i>AI analysis only. Trade at your own risk.</i>""".strip()
+        msg = format_equity_signal(
+            inst, signal, spot, strike, expiry_str, premium,
+            sl_px, sl_val, tp1_px, tp1_val, tp2_px, tp2_val,
+            max_loss, max_profit, lots, confidence, reasons, mode
+        )
         send_telegram(chat_id, msg)
         time.sleep(1)
 
-# ─────────────────────────────────────────────
-#  SIGNAL — CRUDE OIL (with live premium)
-# ─────────────────────────────────────────────
+
 def generate_crude_signal(chat_id: str, mode: str = "crude"):
     if not is_crude_open():
-        send_telegram(chat_id, "⛽ Crude Oil session is not active right now.\n🕓 Crude signals run 4:00 PM – 11:00 PM IST.")
+        send_telegram(chat_id, "⛽ Crude session not active.\n🕓 Crude signals: 4:00 PM – 11:00 PM IST.")
         return
 
     balance = user_balance.get(chat_id, 50000)
@@ -381,7 +455,7 @@ def generate_crude_signal(chat_id: str, mode: str = "crude"):
 
     df_raw = get_ohlcv(inst["symbol"], period="5d", interval="5m")
     if df_raw is None:
-        send_telegram(chat_id, "❌ Could not fetch Crude Oil data. Try again in a minute.")
+        send_telegram(chat_id, "❌ Could not fetch Crude data. Try again shortly.")
         return
 
     df, usd_inr = convert_crude_to_inr(df_raw)
@@ -389,132 +463,103 @@ def generate_crude_signal(chat_id: str, mode: str = "crude"):
     signal, confidence, reasons = score_signal(ind)
 
     if signal is None:
-        send_telegram(chat_id, f"⛽ <b>CRUDE OIL</b>\n\n📊 No clear signal right now.\nMarket consolidating.\nConfidence: {confidence}%\n\n🔄 Next check in 10 minutes.")
+        send_telegram(chat_id, f"🛢️ <b>Crude Oil</b>\n\n📊 No clear signal right now.\nMarket consolidating.\nConfidence: {confidence}%\n\n🔄 Next check in 10 minutes.")
         return
 
-    spot       = ind["price"]   # INR per barrel
-    usd_price  = round(spot / usd_inr, 2)
-    strike     = get_nearest_strike(spot, inst["strike_step"])
-    opt_type   = "CE" if signal == "CALL" else "PE"
+    spot      = ind["price"]
+    usd_price = round(spot / usd_inr, 2)
+    strike    = get_nearest_strike(spot, inst["strike_step"])
+    opt_type  = "CE" if signal == "CALL" else "PE"
+    premium   = fetch_live_crude_premium(strike, opt_type, spot)
 
-    # ── Fetch LIVE premium ──
-    premium = fetch_live_crude_premium(strike, opt_type, spot)
+    # Crude SL: balance-driven, capped at 15% of premium
+    max_loss_rs  = balance * DEFAULT_RISK_PERCENT / 100
+    sl_val       = round(min(max_loss_rs / inst["lot_size"], premium * 0.15), 1)
+    tp1_val      = round(sl_val * 1.5, 1)
+    tp2_val      = round(sl_val * 3.0, 1)
+    sl_px        = round(premium - sl_val, 1)
+    tp1_px       = round(premium + tp1_val, 1)
+    tp2_px       = round(premium + tp2_val, 1)
+    max_loss     = round(sl_val  * inst["lot_size"], 0)
+    max_profit   = round(tp2_val * inst["lot_size"], 0)
 
-    sl_val  = round(premium * SL_PERCENT / 100, 1)
-    tgt_val = round(premium * TARGET_PERCENT / 100, 1)
-    sl_px   = round(premium - sl_val, 1)
-    tgt_px  = round(premium + tgt_val, 1)
-    lots    = calculate_lots(balance, premium, inst["lot_size"])
-    max_loss   = round(sl_val  * lots * inst["lot_size"], 0)
-    max_profit = round(tgt_val * lots * inst["lot_size"], 0)
+    # Crude expiry: last day of current month
+    now = ist_now()
+    import calendar
+    last_day = calendar.monthrange(now.year, now.month)[1]
+    expiry_str = f"{last_day} {now.strftime('%b')}"
 
-    sig_emoji  = "🟢 BUY CALL 📈" if signal == "CALL" else "🔴 BUY PUT 📉"
-    opt_label  = f"{strike}{opt_type}"
-
-    # Wednesday EIA warning
-    eia_note = ""
-    if ist_now().weekday() == 2:   # Wednesday
-        eia_note = "\n⚠️ <b>EIA Inventory data tonight ~9PM — high volatility!</b>"
-
-    msg = f"""
-╔══════════════════════════╗
-   🛢️ CRUDE OIL SIGNAL (MCX)
-╚══════════════════════════╝
-
-{sig_emoji}
-🎯 Strike: <b>CRUDE {opt_label}</b>
-⏰ Evening Session (4PM–11PM IST){eia_note}
-
-💰 <b>Live Premium:</b> ₹{premium}
-🛑 <b>Stop Loss:</b>   ₹{sl_px}  (−₹{sl_val})
-✅ <b>Target:</b>      ₹{tgt_px}  (+₹{tgt_val})
-
-📦 <b>Lots:</b> {lots} × {inst['lot_size']} barrels
-   Max Loss:   ₹{int(max_loss):,}
-   Max Profit: ₹{int(max_profit):,}
-   R:R  →  1:{round(tgt_val/sl_val,1)}
-
-🛢️ MCX Spot:  ₹{spot}/barrel
-🌍 WTI Price: ${usd_price}/barrel
-💱 USD/INR:   ₹{usd_inr}
-📊 ATR: {ind['atr']}   RSI: {ind['rsi']}
-🔵 Confidence: {confidence}%
-
-📋 <b>Reasons:</b>
-{chr(10).join(reasons[:5])}
-
-⚠️ <i>Crude is highly volatile. Use strict SL.
-AI analysis only. Trade at your own risk.</i>""".strip()
+    msg = format_crude_signal(
+        signal, strike, expiry_str, premium,
+        sl_px, sl_val, tp1_px, tp1_val, tp2_px, tp2_val,
+        max_loss, max_profit, spot, usd_price, usd_inr,
+        ind["rsi"], confidence, reasons
+    )
     send_telegram(chat_id, msg)
 
 # ─────────────────────────────────────────────
 #  MORNING BRIEFING
 # ─────────────────────────────────────────────
 def send_morning_briefing(chat_id: str):
-    balance     = user_balance.get(chat_id, 0)
-    today       = ist_now().strftime("%d %b %Y, %A")
-    expiry      = "🔴 TODAY IS EXPIRY DAY!" if is_expiry_thursday() else f"📅 Next expiry: {days_to_expiry()} days"
-    nifty_price = get_current_price("^NSEI")
-    bn_price    = get_current_price("^NSEBANK")
-    crude_usd   = get_current_price("CL=F")
-    usd_inr     = get_usd_inr()
-    crude_inr   = round(crude_usd * usd_inr, 1) if crude_usd else None
-    bal_line    = f"💼 Balance: <b>₹{int(balance):,}</b>  |  Risk/trade: ₹{int(balance*0.02):,}" \
-                  if balance > 0 else "💼 Balance not set. Send: <code>/balance 50000</code>"
+    balance      = user_balance.get(chat_id, 0)
+    today        = ist_now().strftime("%d %b %Y, %A")
+    nifty_price  = get_current_price("^NSEI")
+    sensex_price = get_current_price("^BSESN")
+    crude_usd    = get_current_price("CL=F")
+    usd_inr      = get_usd_inr()
+    crude_inr    = round(crude_usd * usd_inr, 1) if crude_usd else None
+
+    nifty_expiry  = "🔴 TODAY" if ist_now().weekday() == 3 else next_expiry_date(3)
+    sensex_expiry = "🔴 TODAY" if ist_now().weekday() == 4 else next_expiry_date(4)
+
+    bal_line = f"💼 Balance: <b>₹{int(balance):,}</b>  |  Risk/trade: ₹{int(balance*0.02):,}" \
+               if balance > 0 else "💼 Set balance: <code>/balance 50000</code>"
 
     msg = f"""
-🌅 <b>GOOD MORNING — F&amp;O SIGNAL BOT</b>
-📆 {today}   {expiry}
+🌅 <b>Good Morning — F&amp;O Signal Bot</b>
+📆 {today}
 
 📊 <b>Pre-Market Levels:</b>
-   Nifty 50:    ₹{nifty_price or '—'}
-   Bank Nifty:  ₹{bn_price or '—'}
-   Crude Oil:   ₹{crude_inr or '—'}/bbl  (${crude_usd or '—'})
-   USD/INR:     ₹{usd_inr}
+   Nifty 50:  ₹{nifty_price or '—'}   (Expiry: {nifty_expiry})
+   Sensex:    ₹{sensex_price or '—'}   (Expiry: {sensex_expiry})
+   Crude Oil: ₹{crude_inr or '—'}/bbl  (${crude_usd or '—'})
+   USD/INR:   ₹{usd_inr}
 
 {bal_line}
 
-🕘 <b>Equity signals:</b>  9:15 AM – 3:30 PM
-🛢️ <b>Crude signals:</b>  4:00 PM – 11:00 PM
+🕘 Equity signals:  9:15 AM – 3:30 PM
+🛢️ Crude signals:  4:00 PM – 11:00 PM
 
-/balance 50000 → set capital
-/signal        → equity signal now
-/crude         → crude signal now""".strip()
+/signal → get signal now
+/crude  → get crude signal now""".strip()
     send_telegram(chat_id, msg)
 
 # ─────────────────────────────────────────────
-#  EVENING CRUDE BRIEFING
+#  CRUDE BRIEFING
 # ─────────────────────────────────────────────
 def send_crude_briefing(chat_id: str):
     crude_usd = get_current_price("CL=F")
     usd_inr   = get_usd_inr()
     crude_inr = round(crude_usd * usd_inr, 1) if crude_usd else None
     balance   = user_balance.get(chat_id, 0)
-    bal_line  = f"💼 Balance: ₹{int(balance):,}" if balance > 0 else "💼 Set balance: /balance 50000"
-
-    # Wednesday EIA alert
-    eia_note = "\n⚠️ <b>WEDNESDAY — EIA Inventory Report ~9PM IST\nExpect high volatility tonight!</b>" \
-               if ist_now().weekday() == 2 else ""
+    bal_line  = f"💼 Balance: ₹{int(balance):,}" if balance > 0 else "Set balance: /balance 50000"
+    eia_note  = "\n⚠️ <b>WEDNESDAY — EIA Report ~9PM. High volatility tonight!</b>" \
+                if ist_now().weekday() == 2 else ""
 
     msg = f"""
-🌆 <b>CRUDE OIL SESSION STARTING</b>
+🌆 <b>Crude Oil Session Starting</b>
 🕓 4:00 PM – 11:00 PM IST{eia_note}
 
-🛢️ <b>Current Crude Price:</b>
-   MCX:  ₹{crude_inr or '—'}/barrel
-   WTI:  ${crude_usd or '—'}/barrel
-   USD/INR: ₹{usd_inr}
+🛢️ MCX:  ₹{crude_inr or '—'}/barrel
+🌍 WTI:  ${crude_usd or '—'}/barrel
+💱 USD/INR: ₹{usd_inr}
 
 {bal_line}
-
-📡 Auto crude signals every 10 minutes.
-Send /crude to get a signal right now.
-
-⚠️ <i>Use strict stop loss. Crude is volatile.</i>""".strip()
+📡 Auto signals every 10 min. Use /crude anytime.""".strip()
     send_telegram(chat_id, msg)
 
 # ─────────────────────────────────────────────
-#  COMMAND HANDLER
+#  COMMANDS
 # ─────────────────────────────────────────────
 def handle_command(chat_id: str, text: str):
     text = text.strip()
@@ -522,16 +567,15 @@ def handle_command(chat_id: str, text: str):
 
     if cmd == "/start":
         send_telegram(chat_id, """
-👋 <b>Welcome to F&amp;O Signal Bot!</b>
+👋 <b>F&amp;O Signal Bot</b>
 
 Signals for:
-• 📊 Nifty 50         9:15 AM – 3:30 PM
-• 🏦 Bank Nifty       9:15 AM – 3:30 PM
-• 🛢️ Crude Oil (MCX) 4:00 PM – 11:00 PM
+📊 Nifty 50    → every Thursday expiry
+📈 Sensex      → every Friday expiry
+🛢️ Crude Oil  → monthly expiry (4PM–11PM)
 
-Each signal includes:
-✅ Strike (CE/PE)  🎯 Target  🛑 SL
-📦 Lots based on balance  🔵 Confidence %
+Each signal:
+💰 Buy price  🎯 TP1  🎯 TP2  🛑 SL
 
 <b>Start:</b> <code>/balance 50000</code>""".strip())
 
@@ -545,10 +589,10 @@ Each signal includes:
             except:
                 send_telegram(chat_id, "❌ Example: /balance 50000")
         else:
-            send_telegram(chat_id, "Send like: /balance 50000")
+            send_telegram(chat_id, "Example: /balance 50000")
 
     elif cmd == "/signal":
-        send_telegram(chat_id, "🔍 Analyzing Nifty & BankNifty...")
+        send_telegram(chat_id, "🔍 Analyzing Nifty & Sensex...")
         threading.Thread(target=generate_equity_signal, args=(chat_id, "intraday")).start()
 
     elif cmd == "/scalp":
@@ -556,44 +600,38 @@ Each signal includes:
         threading.Thread(target=generate_equity_signal, args=(chat_id, "scalp")).start()
 
     elif cmd == "/crude":
-        send_telegram(chat_id, "🛢️ Fetching live Crude Oil data & premium...")
+        send_telegram(chat_id, "🛢️ Fetching live Crude data...")
         threading.Thread(target=generate_crude_signal, args=(chat_id,)).start()
 
     elif cmd == "/status":
         bal       = user_balance.get(chat_id, 0)
         eq_status = "🟢 OPEN" if is_equity_open() else "🔴 CLOSED"
         cr_status = "🟢 OPEN" if is_crude_open()  else "🔴 CLOSED"
-        expiry    = "🔴 EXPIRY TODAY" if is_expiry_thursday() else f"In {days_to_expiry()} days"
         send_telegram(chat_id, f"""
 📡 <b>Bot Status</b>
-Equity Market:  {eq_status}
-Crude Market:   {cr_status}
-Nifty Expiry:   {expiry}
-Your Balance:   ₹{int(bal):,}
+Equity:  {eq_status}
+Crude:   {cr_status}
+Balance: ₹{int(bal):,}
 
-Auto Signals:
-• Equity: every 5min (scalp), 15min (intraday)
-• Crude:  every 10min (4PM–11PM)""".strip())
+Next Nifty Expiry:  {next_expiry_date(3)}
+Next Sensex Expiry: {next_expiry_date(4)}""".strip())
 
     elif cmd == "/help":
         send_telegram(chat_id, """
 📖 <b>Commands</b>
 
-/balance 50000 → Set your capital
-/signal        → Equity signal now
+/balance 50000 → Set capital
+/signal        → Nifty + Sensex signal now
 /scalp         → Scalp signal now
 /crude         → Crude Oil signal now
 /status        → Market status
 /help          → This menu
 
-📅 <b>Auto Schedule:</b>
+📅 Auto Schedule:
 • 8:45 AM  → Morning briefing
-• 9:15 AM  → Equity signals start
+• 9:15 AM  → Equity signals (every 5/15 min)
 • 3:45 PM  → Crude briefing
-• 4:00 PM  → Crude signals start
-• 11:00 PM → Crude signals stop
-
-⚠️ Always use Stop Loss!""".strip())
+• 4:00 PM  → Crude signals (every 10 min)""".strip())
 
 # ─────────────────────────────────────────────
 #  SCHEDULER
@@ -613,19 +651,16 @@ def scheduler_loop():
 
             for chat_id in list(user_balance.keys()):
 
-                # Morning briefing 8:45 AM
                 if now.hour == MORNING_HOUR and now.minute == MORNING_MIN:
                     if last_morning.get(chat_id) != today_str:
                         send_morning_briefing(chat_id)
                         last_morning[chat_id] = today_str
 
-                # Crude briefing 3:45 PM
                 if now.hour == CRUDE_BRIEF_HOUR and now.minute == CRUDE_BRIEF_MIN:
                     if last_crude_brief.get(chat_id) != today_str:
                         send_crude_briefing(chat_id)
                         last_crude_brief[chat_id] = today_str
 
-                # Equity signals
                 if is_equity_open():
                     if ts - last_scalp.get(chat_id, 0) >= SCALP_INTERVAL:
                         threading.Thread(target=generate_equity_signal, args=(chat_id, "scalp")).start()
@@ -633,15 +668,17 @@ def scheduler_loop():
                     if ts - last_intraday.get(chat_id, 0) >= INTRADAY_INTERVAL:
                         threading.Thread(target=generate_equity_signal, args=(chat_id, "intraday")).start()
                         last_intraday[chat_id] = ts
-                    if is_expiry_thursday():
-                        for (h, m) in [(9, 20), (14, 0), (15, 0)]:
-                            if now.hour == h and now.minute == m:
-                                key = f"expiry_{h}_{today_str}_{chat_id}"
-                                if not active_signals.get(key):
-                                    threading.Thread(target=generate_equity_signal, args=(chat_id, "expiry")).start()
-                                    active_signals[key] = True
 
-                # Crude signals 4 PM – 11 PM
+                    # Expiry day special signals
+                    for inst in EQUITY_INSTRUMENTS:
+                        if is_expiry_today(inst["expiry_day"]):
+                            for (h, m) in [(9, 20), (14, 0), (15, 0)]:
+                                if now.hour == h and now.minute == m:
+                                    key = f"expiry_{inst['name']}_{h}_{today_str}_{chat_id}"
+                                    if not active_signals.get(key):
+                                        threading.Thread(target=generate_equity_signal, args=(chat_id, "expiry")).start()
+                                        active_signals[key] = True
+
                 if is_crude_open():
                     if ts - last_crude.get(chat_id, 0) >= CRUDE_INTERVAL:
                         threading.Thread(target=generate_crude_signal, args=(chat_id,)).start()
@@ -656,8 +693,8 @@ def scheduler_loop():
 #  MAIN
 # ─────────────────────────────────────────────
 def main():
-    print("🤖 F&O Signal Bot (Equity + Crude) started...")
-    send_telegram(TELEGRAM_CHAT_ID, "🤖 Bot started!\n\nSend /start to begin.\n📊 Equity: 9:15AM–3:30PM\n🛢️ Crude: 4:00PM–11:00PM")
+    print("🤖 Bot started — Nifty + Sensex + Crude Oil")
+    send_telegram(TELEGRAM_CHAT_ID, "🤖 Bot started!\n\n📊 Nifty 50 + Sensex + 🛢️ Crude Oil\nSend /start to begin.")
     threading.Thread(target=scheduler_loop, daemon=True).start()
 
     offset = None
