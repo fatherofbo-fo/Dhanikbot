@@ -32,8 +32,8 @@ IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 EQUITY_OPEN  = datetime.time(9, 15)
 EQUITY_CLOSE = datetime.time(15, 30)
-CRUDE_OPEN   = datetime.time(16, 0)
-CRUDE_CLOSE  = datetime.time(23, 0)
+CRUDE_OPEN   = datetime.time(9, 0)     # 9:00 AM
+CRUDE_CLOSE  = datetime.time(23, 0)    # 11:00 PM
 
 SCALP_INTERVAL    = 300    # 5 min
 INTRADAY_INTERVAL = 900    # 15 min
@@ -42,8 +42,8 @@ LEVEL_SCAN_INTERVAL = 120  # 2 min
 
 MORNING_HOUR     = 8
 MORNING_MIN      = 45
-CRUDE_BRIEF_HOUR = 15
-CRUDE_BRIEF_MIN  = 45
+CRUDE_BRIEF_HOUR = 8
+CRUDE_BRIEF_MIN  = 50
 
 DEFAULT_RISK_PERCENT = 2.0
 MIN_CONFIDENCE       = 55   # Only send signals with 55%+ confidence
@@ -155,13 +155,93 @@ def convert_crude_to_inr(df: pd.DataFrame):
 def ist_now():
     return datetime.datetime.now(IST)
 
+# ─────────────────────────────────────────────
+#  HOLIDAY CALENDARS 2026
+#  Source: NSE/BSE/MCX official holiday lists
+# ─────────────────────────────────────────────
+
+# NSE/BSE holidays — full day closed (equity F&O)
+NSE_HOLIDAYS_2026 = {
+    datetime.date(2026, 1, 26),   # Republic Day
+    datetime.date(2026, 3,  3),   # Holi
+    datetime.date(2026, 3, 26),   # Ram Navami
+    datetime.date(2026, 3, 31),   # Mahavir Jayanti
+    datetime.date(2026, 4,  3),   # Good Friday
+    datetime.date(2026, 4, 14),   # Ambedkar Jayanti
+    datetime.date(2026, 5,  1),   # Maharashtra Day
+    datetime.date(2026, 5, 28),   # Bakri Id
+    datetime.date(2026, 6, 26),   # Muharram
+    datetime.date(2026, 9, 14),   # Ganesh Chaturthi
+    datetime.date(2026, 10, 2),   # Gandhi Jayanti
+    datetime.date(2026, 10, 10),  # Dussehra
+    datetime.date(2026, 11, 10),  # Diwali-Balipratipada
+    datetime.date(2026, 11, 24),  # Guru Nanak Jayanti
+    datetime.date(2026, 12, 25),  # Christmas
+}
+
+# MCX holidays — FULL day closed (both morning + evening sessions)
+MCX_FULL_HOLIDAYS_2026 = {
+    datetime.date(2026, 1, 26),   # Republic Day
+    datetime.date(2026, 4,  3),   # Good Friday
+    datetime.date(2026, 10, 2),   # Gandhi Jayanti
+    datetime.date(2026, 12, 25),  # Christmas
+}
+
+# MCX partial holidays — morning closed, evening (5PM+) open
+# We set crude to 9AM so on these days crude only runs 5PM-11PM
+MCX_PARTIAL_HOLIDAYS_2026 = {
+    datetime.date(2026, 3,  3),   # Holi
+    datetime.date(2026, 3, 26),   # Ram Navami
+    datetime.date(2026, 3, 31),   # Mahavir Jayanti
+    datetime.date(2026, 4, 14),   # Ambedkar Jayanti
+    datetime.date(2026, 5,  1),   # Maharashtra Day
+    datetime.date(2026, 5, 28),   # Bakri Id
+    datetime.date(2026, 6, 26),   # Muharram
+    datetime.date(2026, 9, 14),   # Ganesh Chaturthi
+    datetime.date(2026, 10, 10),  # Dussehra
+    datetime.date(2026, 11, 10),  # Diwali
+    datetime.date(2026, 11, 24),  # Guru Nanak Jayanti
+}
+
+def is_nse_holiday(date: datetime.date = None) -> bool:
+    d = date or ist_now().date()
+    # Saturday = 5, Sunday = 6
+    if d.weekday() >= 5:
+        return True
+    return d in NSE_HOLIDAYS_2026
+
+def is_mcx_full_holiday(date: datetime.date = None) -> bool:
+    d = date or ist_now().date()
+    if d.weekday() == 6:   # Sunday always closed
+        return True
+    return d in MCX_FULL_HOLIDAYS_2026
+
+def is_mcx_partial_holiday(date: datetime.date = None) -> bool:
+    """Morning session closed, evening open after 5PM"""
+    d = date or ist_now().date()
+    return d in MCX_PARTIAL_HOLIDAYS_2026
+
 def is_equity_open():
     now = ist_now()
-    return now.weekday() < 5 and EQUITY_OPEN <= now.time() <= EQUITY_CLOSE
+    if is_nse_holiday(now.date()):
+        return False
+    return EQUITY_OPEN <= now.time() <= EQUITY_CLOSE
 
 def is_crude_open():
-    now = ist_now()
-    return now.weekday() < 6 and CRUDE_OPEN <= now.time() <= CRUDE_CLOSE
+    now  = ist_now()
+    date = now.date()
+    t    = now.time()
+    # Full holiday — closed all day
+    if is_mcx_full_holiday(date):
+        return False
+    # Saturday — only morning session (9AM-2PM), no evening
+    if date.weekday() == 5:
+        return datetime.time(9, 0) <= t <= datetime.time(14, 0)
+    # Partial holiday — morning closed, evening open from 5PM
+    if is_mcx_partial_holiday(date):
+        return datetime.time(17, 0) <= t <= CRUDE_CLOSE
+    # Normal day: 9AM to 11PM
+    return CRUDE_OPEN <= t <= CRUDE_CLOSE
 
 def next_expiry_date(expiry_weekday: int) -> str:
     now = ist_now()
@@ -180,85 +260,133 @@ def is_expiry_today(expiry_weekday: int) -> bool:
     return ist_now().weekday() == expiry_weekday
 
 # ─────────────────────────────────────────────
-#  LIVE OPTION PRICE — NSE API
-#  Fetches real CE/PE premium from NSE option chain
+#  LIVE OPTION PRICE — NSE API (FIXED)
 # ─────────────────────────────────────────────
-def fetch_nse_option_price(symbol: str, strike: int, opt_type: str, expiry_str: str) -> float:
-    """
-    Fetch real option price from NSE option chain.
-    symbol: NIFTY or BANKNIFTY
-    opt_type: CE or PE
-    Returns LTP (last traded price)
-    """
+
+# Persistent NSE session (reuse cookies)
+_nse_session = None
+
+def get_nse_session():
+    global _nse_session
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "*/*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.nseindia.com/",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
         }
-        session = requests.Session()
-        # First hit homepage to get cookies
-        session.get("https://www.nseindia.com", headers=headers, timeout=8)
+        s = requests.Session()
+        s.headers.update(headers)
+        # Hit NSE homepage to get cookies
+        s.get("https://www.nseindia.com", timeout=10)
+        time.sleep(1)
+        # Hit option chain page to refresh cookies
+        s.get("https://www.nseindia.com/option-chain", timeout=10)
         time.sleep(0.5)
+        _nse_session = s
+        print("NSE session created successfully")
+        return s
+    except Exception as e:
+        print(f"NSE session error: {e}")
+        return None
 
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        r   = session.get(url, headers=headers, timeout=10)
-
-        if r.status_code != 200:
+def fetch_nse_option_price(symbol: str, strike: int, opt_type: str) -> float:
+    """
+    Fetch real LTP from NSE option chain API.
+    Returns float price or None if failed.
+    """
+    global _nse_session
+    try:
+        if _nse_session is None:
+            _nse_session = get_nse_session()
+        if _nse_session is None:
             return None
 
-        data   = r.json()
+        api_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.nseindia.com/option-chain",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+        r   = _nse_session.get(url, headers=api_headers, timeout=10)
+
+        if r.status_code == 401 or r.status_code == 403:
+            # Session expired — refresh
+            print("NSE session expired, refreshing...")
+            _nse_session = get_nse_session()
+            if _nse_session:
+                r = _nse_session.get(url, headers=api_headers, timeout=10)
+
+        if r.status_code != 200:
+            print(f"NSE API status: {r.status_code}")
+            return None
+
+        data    = r.json()
         records = data.get("records", {}).get("data", [])
 
         for rec in records:
-            if rec.get("strikePrice") == strike:
+            if int(rec.get("strikePrice", 0)) == int(strike):
                 opt_data = rec.get(opt_type, {})
                 ltp = opt_data.get("lastPrice", 0)
-                if ltp and ltp > 0:
+                if ltp and float(ltp) > 0:
+                    print(f"NSE LIVE: {symbol} {strike}{opt_type} = ₹{ltp}")
                     return round(float(ltp), 2)
+
+        print(f"Strike {strike} not found in NSE chain for {symbol}")
+        return None
+
     except Exception as e:
-        print(f"NSE option price error: {e}")
-    return None
+        print(f"NSE fetch error: {e}")
+        _nse_session = None   # reset session on error
+        return None
 
 
-def fetch_crude_option_price(strike: int, opt_type: str, spot_inr: float) -> float:
+def estimate_option_price(spot: float, strike: int, opt_type: str,
+                           atr: float, days: int) -> float:
     """
-    Fetch crude option price.
-    Primary: try NSE MCX proxy
-    Fallback: realistic Black-Scholes estimate
+    Improved estimation using proper Black-Scholes approximation.
+    Much more accurate than simple ATR formula.
+    Nifty ATM options: IV is typically 12-18%, use 15% as base.
     """
-    # Realistic fallback based on moneyness
-    # Crude ATM options trade at roughly 1.5-3% of spot
-    atm      = round(spot_inr / 100) * 100
-    distance = abs(strike - atm)
-    moneyness_ratio = distance / spot_inr
+    # Implied Volatility assumption: 15% annual for Nifty/Sensex
+    iv         = 0.15
+    T          = max(days, 0.25) / 365   # time in years
+    vol_factor = iv * math.sqrt(T)        # e.g. 3 days → ~0.018
 
-    # ATM premium ~2% of spot, drops exponentially with distance
-    base_premium = spot_inr * 0.020
-    decay        = math.exp(-moneyness_ratio * 8)
-    days         = max(1, days_to_expiry(3))  # crude uses ~monthly but estimate
-    time_factor  = math.sqrt(days / 20)
+    # Intrinsic value
+    intrinsic = max(0, spot - strike) if opt_type == "CE" else max(0, strike - spot)
 
-    premium = round(base_premium * decay * time_factor, 1)
-    return max(premium, 10.0)   # minimum ₹10
+    # Time value using simplified BSM: 0.4 * S * σ * √T for ATM
+    distance  = abs(spot - strike) / spot
+    atm_time_val = 0.4 * spot * vol_factor
+    # Decay for OTM: drops as distance from ATM increases
+    decay = math.exp(-distance * 5)
+    time_val = atm_time_val * decay
+
+    premium = round(intrinsic + time_val, 1)
+    # Sanity check: premium should be 0.3% to 8% of spot
+    min_p = round(spot * 0.003, 1)
+    max_p = round(spot * 0.08, 1)
+    return max(min_p, min(premium, max_p))
 
 
-def get_option_price(inst: dict, strike: int, opt_type: str, spot: float,
-                     days: int, atr: float) -> tuple:
+def get_option_price(inst: dict, strike: int, opt_type: str,
+                     spot: float, days: int, atr: float) -> tuple:
     """
-    Returns (premium, source) where source = 'LIVE' or 'ESTIMATED'
+    1. Try NSE live price
+    2. Fallback to improved BSM estimate
+    Returns (price, source_label)
     """
-    # Try live NSE price first
-    live = fetch_nse_option_price(inst.get("nse_symbol", inst["name"]), strike, opt_type, "")
-    if live and live > 5:
+    # Try live
+    live = fetch_nse_option_price(inst.get("nse_symbol", inst["name"]), strike, opt_type)
+    if live and live > 2:
         return live, "LIVE ✅"
 
-    # Fallback: estimate using ATR-based model
-    time_val  = atr * math.sqrt(max(days, 0.5)) * 0.35
-    intrinsic = max(0, spot - strike) if opt_type == "CE" else max(0, strike - spot)
-    est = round(intrinsic + time_val, 1)
-    return max(est, 5.0), "EST ⚡"
+    # Improved estimate
+    est = estimate_option_price(spot, strike, opt_type, atr, days)
+    print(f"EST: {inst['name']} {strike}{opt_type} spot={spot} days={days} → ₹{est}")
+    return est, "EST ⚡"
 
 # ─────────────────────────────────────────────
 #  TECHNICAL ANALYSIS — FIXED
@@ -828,8 +956,16 @@ def generate_crude_signal(chat_id: str, mode: str = "crude"):
     spot      = ind_5m["price"]
     usd_price = round(spot / usd_inr, 2)
     strike    = get_nearest_strike(spot, CRUDE_INSTRUMENT["strike_step"])
-    premium   = fetch_crude_option_price(strike, signal, spot)
-    src       = "EST ⚡"
+
+    # Crude IV is higher ~30-40%, use 35%
+    days_exp   = max(1, (calendar.monthrange(ist_now().year, ist_now().month)[1] - ist_now().day))
+    T          = days_exp / 365
+    vol_factor = 0.35 * math.sqrt(T)
+    intrinsic  = max(0, spot - strike) if signal == "CE" else max(0, strike - spot)
+    distance   = abs(spot - strike) / spot
+    time_val   = 0.4 * spot * vol_factor * math.exp(-distance * 4)
+    premium    = round(max(intrinsic + time_val, 20.0), 1)
+    src        = "EST ⚡"
 
     # Crude SL: balance-driven
     max_loss_rs = balance * DEFAULT_RISK_PERCENT / 100
@@ -861,20 +997,33 @@ def generate_crude_signal(chat_id: str, mode: str = "crude"):
 # ─────────────────────────────────────────────
 def send_morning_briefing(chat_id: str):
     balance      = user_balance.get(chat_id, 0)
-    today        = ist_now().strftime("%d %b %Y, %A")
+    now          = ist_now()
+    today        = now.strftime("%d %b %Y, %A")
     nifty_price  = get_current_price("^NSEI")
     sensex_price = get_current_price("^BSESN")
     crude_usd    = get_current_price("CL=F")
     usd_inr      = get_usd_inr()
     crude_inr    = round(crude_usd * usd_inr, 1) if crude_usd else None
-    nifty_exp    = "🔴 TODAY" if ist_now().weekday() == 1 else next_expiry_date(1)
-    sensex_exp   = "🔴 TODAY" if ist_now().weekday() == 3 else next_expiry_date(3)
+    nifty_exp    = "🔴 TODAY" if now.weekday() == 1 else next_expiry_date(1)
+    sensex_exp   = "🔴 TODAY" if now.weekday() == 3 else next_expiry_date(3)
     bal_line     = f"💼 Balance: <b>₹{int(balance):,}</b>  Risk/trade: ₹{int(balance*0.02):,}" \
                    if balance > 0 else "💼 Set balance: <code>/balance 50000</code>"
 
+    # Holiday warnings
+    holiday_note = ""
+    if is_nse_holiday(now.date()):
+        holiday_note = "\n🚫 <b>NSE/BSE HOLIDAY TODAY — No equity signals</b>"
+    if is_mcx_full_holiday(now.date()):
+        holiday_note += "\n🚫 <b>MCX HOLIDAY TODAY — No crude signals</b>"
+    elif is_mcx_partial_holiday(now.date()):
+        holiday_note += "\n⚠️ <b>MCX Partial Holiday — Crude signals from 5:00 PM only</b>"
+
+    crude_timing = "5:00 PM – 11:00 PM (partial holiday)" \
+                   if is_mcx_partial_holiday(now.date()) else "9:00 AM – 11:00 PM"
+
     send_telegram(chat_id, f"""
 🌅 <b>Good Morning — F&amp;O Signal Bot</b>
-📆 {today}
+📆 {today}{holiday_note}
 
 📊 Nifty 50:  ₹{nifty_price or '—'}  (Expiry: {nifty_exp})
 📈 Sensex:    ₹{sensex_price or '—'}  (Expiry: {sensex_exp})
@@ -884,7 +1033,7 @@ def send_morning_briefing(chat_id: str):
 {bal_line}
 
 🕘 Equity: 9:15 AM – 3:30 PM
-🛢️ Crude:  4:00 PM – 11:00 PM
+🛢️ Crude:  {crude_timing}
 📐 Key levels sent at 9:16 AM""".strip())
 
 
@@ -961,12 +1110,17 @@ Each signal shows:
         threading.Thread(target=generate_crude_signal, args=(chat_id,)).start()
 
     elif cmd == "/status":
-        bal = user_balance.get(chat_id, 0)
-        eq  = "🟢 OPEN" if is_equity_open() else "🔴 CLOSED"
-        cr  = "🟢 OPEN" if is_crude_open()  else "🔴 CLOSED"
+        bal  = user_balance.get(chat_id, 0)
+        now  = ist_now()
+        eq   = "🟢 OPEN" if is_equity_open()  else "🔴 CLOSED"
+        cr   = "🟢 OPEN" if is_crude_open()   else "🔴 CLOSED"
+        nse_hol = "🚫 Holiday" if is_nse_holiday(now.date())     else "✅ Trading day"
+        mcx_hol = "🚫 Holiday" if is_mcx_full_holiday(now.date()) else \
+                  ("⚠️ Partial (eve only)" if is_mcx_partial_holiday(now.date()) else "✅ Trading day")
         send_telegram(chat_id, f"""
 📡 <b>Bot Status</b>
-Equity: {eq}  |  Crude: {cr}
+Equity:  {eq}  ({nse_hol})
+Crude:   {cr}  ({mcx_hol})
 Nifty Expiry:  {next_expiry_date(1)}
 Sensex Expiry: {next_expiry_date(3)}
 Balance: ₹{int(bal):,}
@@ -985,15 +1139,23 @@ Confidence min: {MIN_CONFIDENCE}%""".strip())
 
 📅 Auto Schedule:
 • 8:45 AM  → Morning briefing
+• 8:50 AM  → Crude Oil briefing
+• 9:00 AM  → Crude signals start
+• 9:15 AM  → Equity signals start
 • 9:16 AM  → Key levels sent
-• 9:15 AM+ → Equity signals (5/15 min)
 • Every 2 min → Level breakout scan
-• 3:45 PM  → Crude briefing
-• 4:00 PM+ → Crude signals (10 min)
+• Every 5 min → Scalp signals
+• Every 15 min → Intraday signals
+• 11:00 PM → Crude signals stop
 
-✅ Signals use CE / PE labels clearly
-✅ Uses 5min + 15min timeframes
-✅ Min 55% confidence to send signal""".strip())
+🚫 <b>Holidays — No signals:</b>
+• Saturday &amp; Sunday (equity)
+• All govt holidays (NSE list)
+• MCX partial holidays: crude 5PM+
+
+✅ CE / PE shown clearly
+✅ 5min + 15min analysis
+✅ Min 55% confidence only""".strip())
 
 # ─────────────────────────────────────────────
 #  SCHEDULER
@@ -1047,8 +1209,10 @@ def scheduler_loop():
                         print(f"[{now.strftime('%H:%M')}] Scalp → {chat_id}")
                         threading.Thread(target=generate_equity_signal, args=(chat_id, "scalp")).start()
                         last_scalp[chat_id] = ts
+                        # Stagger intraday — don't fire both at same time
+                        last_intraday[chat_id] = ts
 
-                    if ts - last_intraday.get(chat_id, 0) >= INTRADAY_INTERVAL:
+                    elif ts - last_intraday.get(chat_id, 0) >= INTRADAY_INTERVAL:
                         print(f"[{now.strftime('%H:%M')}] Intraday → {chat_id}")
                         threading.Thread(target=generate_equity_signal, args=(chat_id, "intraday")).start()
                         last_intraday[chat_id] = ts
