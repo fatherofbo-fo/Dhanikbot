@@ -32,7 +32,7 @@ IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 EQUITY_OPEN  = datetime.time(9, 15)
 EQUITY_CLOSE = datetime.time(15, 30)
-CRUDE_OPEN   = datetime.time(9, 0)     # 9:00 AM
+CRUDE_OPEN   = datetime.time(9, 15)     # 9:15 AM
 CRUDE_CLOSE  = datetime.time(23, 0)    # 11:00 PM
 
 SCALP_INTERVAL    = 300    # 5 min
